@@ -10,7 +10,6 @@ import StdlibUnittest
 var StringTensorTests = TestSuite("String")
 
 StringTensorTests.test("StringComparison") {
-
   let t1 = Tensor("foo")
   let result1 = t1.elementsEqual(t1)
   expectEqual(ShapedArray(shape: [], scalars: [true]), result1.array)
@@ -24,7 +23,12 @@ StringTensorTests.test("StringComparison") {
   let result3 = t2.elementsEqual(t3)
   expectEqual(ShapedArray(shape: [2], scalars: [false, true]),
               result3.array)
+}
 
+StringTensorTests.test("StringTensorInit") {
+  let x = Tensor("foo")
+  expectEqual(ShapedArray(shape: [], scalars: ["foo"]),
+              x.array)
 }
 
 runAllTests()

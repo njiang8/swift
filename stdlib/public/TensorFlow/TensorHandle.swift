@@ -166,6 +166,7 @@ internal extension ShapedArray where Scalar : AccelerableByTensorFlow {
     TF_DeleteStatus(status)
     debugLog("# of dims is \(TF_NumDims(cTensor!))")
     debugLog("Returning a shaped array.")
-    self.init(owning: cTensor!)
+    self.init(cTensor: cTensor!)
+    TF_DeleteTensor(cTensor!)
   }
 }

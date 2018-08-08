@@ -14,143 +14,21 @@ import Swift
 import CTensorFlow
 
 //===----------------------------------------------------------------------===//
-// TensorBuffer
-//===----------------------------------------------------------------------===//
-
-/// `TensorBuffer` is the internal storage of `ShapedArray`. This buffer has
-/// two modes of storage: 'native' and 'tensorFlow'. In 'native' mode, the
-/// buffer object stores a pointer to contiguous scalars; in 'tensorFlow'
-/// mode, the buffer object stores a `TF_Tensor*` and bridges to TensorFlow.
-/// In either mode, the buffer object owns the memory and will deallocate it
-/// on `deinit`.
-@_fixed_layout @usableFromInline
-internal final class TensorBuffer<Scalar> {
-  typealias Shape = [Int]
-
-  /// A reference type wrapping a Swift Array.
-  /// - Note: an Array is used as the native storage for `TensorBuffer`. To make
-  /// in-place mutation possible when the array is stored in an enum value, the
-  /// array must be wrapped in a reference type.
-  @_fixed_layout @usableFromInline
-  final class BoxedArray {
-    var array: [Scalar]
-
-    init(_ array: [Scalar]) {
-      self.array = array
-    }
-  }
-
-  enum Allocation {
-    case native(BoxedArray)
-    case tensorFlow(CTensor)
-  }
-
-  let allocation: Allocation
-  let count: Int
-
-  deinit {
-    debugLog("De-initializing tensor buffer.")
-    switch allocation {
-    case .native:
-      debugLog("Deallocating underlying buffer.")
-    case let .tensorFlow(cTensor):
-      debugLog("Deleting underlying tensor.")
-      TF_DeleteTensor(cTensor)
-    }
-    debugLog("Returning from deinit of TensorBuffer.")
-  }
-
-  init(allocation: Allocation, count: Int) {
-    self.allocation = allocation
-    self.count = count
-  }
-}
-
-/// TF Tensor-specific initializer
-extension TensorBuffer where Scalar : AccelerableByTensorFlow {
-  /// Creates a local tensor buffer from a C `TF_Tensor*` value and takes
-  /// ownership of the value.
-  convenience init(owning cTensor: CTensor, count: Int) {
-    debugLog("Initializing TensorBuffer with a cTensor of \(count) elements.")
-    let actualCount = (0..<TF_NumDims(cTensor)).reduce(1) { acc, next in
-      acc * Int(TF_Dim(cTensor, next))
-    }
-    assert(actualCount == count)
-    self.init(allocation: .tensorFlow(cTensor), count: count)
-  }
-}
-
-/// Factory methods
-extension TensorBuffer {
-  static func create(
-    count: Int,
-    withInitializer body: (UnsafeMutableBufferPointer<Scalar>) -> Void
-  ) -> TensorBuffer<Scalar> {
-    /// Since `Scalar` may be any generic type, it is not possible to construct
-    /// an instance of `Scalar` directly for use with the
-    /// `Array(repeating:count:)` initializer. The workaround here is to
-    /// allocate a dummy `Scalar` pointer of size 1 and to use the pointee value
-    /// as the `repeatedValue` of the initializer.
-    let dummyPointer = UnsafeMutablePointer<Scalar>.allocate(capacity: 1)
-    var array = Array(repeating: dummyPointer.move(), count: count)
-    array.withUnsafeMutableBufferPointer { body($0) }
-    dummyPointer.deallocate()
-    return TensorBuffer(allocation: .native(BoxedArray(array)), count: count)
-  }
-}
-
-/// Unsafe address accessor
-extension TensorBuffer {
-  func withUnsafeMutableBufferPointer<R>(
-    _ body: (inout UnsafeMutableBufferPointer<Scalar>) throws -> R
-  ) rethrows -> R {
-    switch allocation {
-    case let .native(box):
-      return try box.array.withUnsafeMutableBufferPointer { bufferPtr in
-        try body(&bufferPtr)
-      }
-    case let .tensorFlow(cTensor):
-      let startAddress = TF_TensorData(cTensor)
-        .assumingMemoryBound(to: Scalar.self)
-      var bufferPointer = UnsafeMutableBufferPointer(
-        start: startAddress, count: count
-      )
-      return try body(&bufferPointer)
-    }
-  }
-
-  func withUnsafeBufferPointer<R>(
-    _ body: (inout UnsafeBufferPointer<Scalar>) throws -> R
-  ) rethrows -> R {
-    switch allocation {
-    case let .native(box):
-      return try box.array.withUnsafeBufferPointer { bufferPtr in
-        var bufferPtr = bufferPtr
-        return try body(&bufferPtr)
-      }
-    case let .tensorFlow(cTensor):
-      let startAddress = TF_TensorData(cTensor)
-        .assumingMemoryBound(to: Scalar.self)
-      var bufferPointer = UnsafeBufferPointer(
-        start: startAddress, count: count
-      )
-      return try body(&bufferPointer)
-    }
-  }
-}
-
-//===----------------------------------------------------------------------===//
 // ShapedArrayProtocol, the protocol unifying ShapedArray and ShapedArraySlice.
 //===----------------------------------------------------------------------===//
 
 public protocol _ShapedArrayProtocol
   : RandomAccessCollection, MutableCollection {
   associatedtype Scalar
+  associatedtype ScalarCollection : RandomAccessCollection, MutableCollection
+      where ScalarCollection.Element == Scalar
 
   /// The number of dimensions of the array.
   var rank: Int { get }
   /// The dimensions of the array.
   var shape: [Int] { get }
+  /// The scalars in row-major order.
+  var scalars: ScalarCollection { get set }
   /// The total number of scalars in the array.
   var scalarCount: Int { get }
 
@@ -191,19 +69,6 @@ public protocol _ShapedArrayProtocol
 }
 
 public extension _ShapedArrayProtocol {
-  /// The scalars of the array in row-major order.
-  var scalars: [Scalar] {
-    get {
-      return withUnsafeBufferPointer(Array.init)
-    }
-    set {
-      precondition(newValue.count == scalarCount, "Scalar count mismatch.")
-      withUnsafeMutableBufferPointer { ptr in
-        ptr.baseAddress!.initialize(from: newValue, count: newValue.count)
-      }
-    }
-  }
-
   /// Returns `true` if the array has rank 0.
   var isScalar: Bool {
     return rank == 0
@@ -269,11 +134,7 @@ fileprivate extension _ShapedArrayProtocol
 
 fileprivate extension _ShapedArrayProtocol where Scalar : Equatable {
   func _isEqual(to other: Self) -> Bool {
-    return shape == other.shape && withUnsafeBufferPointer { selfBuf in
-      other.withUnsafeBufferPointer { otherBuf in
-        selfBuf.elementsEqual(otherBuf)
-      }
-    }
+    return shape == other.shape && scalars.elementsEqual(other.scalars)
   }
 }
 
@@ -282,48 +143,38 @@ fileprivate extension _ShapedArrayProtocol where Scalar : Equatable {
 //===----------------------------------------------------------------------===//
 
 /// `ShapedArray` is a multi-dimensional array. It has a shape, which has type
-/// `[Int]` and defines the array dimensions, and uses a `TensorBuffer`
+/// `[Int]` and defines the array dimensions, and uses an array of `Scalar`
 /// internally as storage.
 @_fixed_layout
 public struct ShapedArray<Scalar> : _ShapedArrayProtocol {
-  /// Contiguous memory storing scalars.
-  internal var buffer: TensorBuffer<Scalar>
+  /// Array of scalars
+  public var scalars: [Scalar] {
+    willSet {
+      precondition(newValue.count == scalarCount, "Scalar count mismatch.")
+    }
+  }
 
   /// The dimensions of the array.
   public private(set) var shape: [Int]
 
-  /// Creates a `ShapedArray` from a `TensorBuffer` and a shape.
-  internal init(buffer: TensorBuffer<Scalar>, shape: [Int]) {
-    precondition(buffer.count == shape.reduce(1, *),
+  /// Creates a `ShapedArray` from an array and a shape.
+  public init(shape: [Int], scalars: [Scalar]) {
+    precondition(scalars.count == shape.reduce(1, *),
       "The scalar count of the buffer does not match the shape.")
-    self.buffer = buffer
+    self.scalars = scalars
     self.shape = shape
-    debugLog("Done initializing ShapedArray from TensorBuffer.")
-  }
-}
-
-fileprivate extension ShapedArray {
-  mutating func ensureUniquelyReferenced() {
-    if isKnownUniquelyReferenced(&buffer) { return }
-    let oldBuffer = buffer
-    debugLog("Unique reference check")
-    buffer = TensorBuffer.create(count: scalarCount) { buffPtr in
-      let ptr = buffPtr.baseAddress!
-      oldBuffer.withUnsafeBufferPointer { oldBuffPtr in
-        let oldPtr = oldBuffPtr.baseAddress!
-        ptr.initialize(from: oldPtr, count: scalarCount)
-      }
-    }
+    debugLog("Done initializing ShapedArray from [Scalar].")
   }
 }
 
 internal extension ShapedArray where Scalar : AccelerableByTensorFlow {
   @usableFromInline
-  init(owning cTensor: CTensor) {
+  init(cTensor: CTensor) {
+    print("Initialize from cTensor")
     // Including \(Scalar.self) into the message would cause non-deterministic
     // crashes.
     debugLog("Initializing ShapedArray from CTensor.")
-    shape = (0..<TF_NumDims(cTensor)).map { Int(TF_Dim(cTensor, $0)) }
+    self.shape = (0..<TF_NumDims(cTensor)).map { Int(TF_Dim(cTensor, $0)) }
     if _RuntimeConfig.printsDebugLog {
       // Without this local variable, passing the string directly into
       // debugLog() would not work, because 'self' is captured by the auto
@@ -331,7 +182,47 @@ internal extension ShapedArray where Scalar : AccelerableByTensorFlow {
       let shapeStr = "The shape is \(shape)."
       debugLog(shapeStr)
     }
-    buffer = TensorBuffer(owning: cTensor, count: shape.reduce(1, *))
+    let count = shape.reduce(1, *)
+    let cTensorPtr = TF_TensorData(cTensor)!
+    let cTensorSize = TF_TensorByteSize(cTensor)
+    let dtype = TF_TensorType(cTensor)
+    if dtype == TF_STRING {
+      // decode string tensors and store
+      var stringArray: [String] = []
+      let offsetSize = count * MemoryLayout<UInt64>.stride
+      let strStart = cTensorPtr.advanced(by: offsetSize)
+                               .assumingMemoryBound(to: Int8.self)
+      let offsetBuf = cTensorPtr.bindMemory(to: UInt64.self, capacity: count)
+      let cTensorEnd = cTensorPtr + cTensorSize
+      var nextStrStart = strStart
+      var cString: UnsafePointer<Int8>?
+      var cStringLen: Int = 0
+      let status = TF_NewStatus()
+      for i in 0..<count {
+        precondition(nextStrStart == strStart.advanced(by: Int(offsetBuf[i])),
+                     "Incorrect pointer to read")
+        let bytesRead = TF_StringDecode(nextStrStart,
+                                        UnsafeRawPointer(nextStrStart)
+                                          .distance(to: cTensorEnd),
+                                        &cString, &cStringLen, status)
+        print("bytesRead \(bytesRead)")
+        checkOk(status)
+        nextStrStart = nextStrStart.advanced(by: bytesRead)
+        stringArray.append(String(cString: cString!))
+      }
+      TF_DeleteStatus(status)
+      self.scalars = stringArray as! [Scalar]
+    }
+    else {
+      let dummyPointer = UnsafeMutablePointer<Scalar>.allocate(capacity: 1)
+      self.scalars = Array(repeating: dummyPointer.move(), count: count)
+      dummyPointer.deallocate()
+      // perform memcpy for non-String scalars
+      let tensorData = cTensorPtr.assumingMemoryBound(to: Scalar.self)
+      self.scalars.withUnsafeMutableBufferPointer { [count] bufPtr in
+        bufPtr.baseAddress?.initialize(from: tensorData, count: count)
+      }
+    }
     debugLog("Done initializing ShapedArray from CTensor.")
   }
 }
@@ -342,52 +233,28 @@ public extension ShapedArray {
   }
 
   var scalarCount: Int {
-    return buffer.count
+    return scalars.count
   }
 
   init(_ other: ShapedArray) {
     debugLog("Initializing from another ShapedArray.")
-    self.init(buffer: other.buffer, shape: other.shape)
-  }
-
-  init(shape: [Int], scalars: [Scalar]) {
-    let scalarCount = shape.reduce(1, *)
-    precondition(scalarCount == scalars.count, "Scalar count mismatch.")
-    let buffer = TensorBuffer<Scalar>.create(count: scalarCount) { buffPtr in
-      let ptr = buffPtr.baseAddress!
-      scalars.withUnsafeBufferPointer { arrayBuf in
-        ptr.initialize(from: arrayBuf.baseAddress!, count: scalarCount)
-      }
-    }
-    self.init(buffer: buffer, shape: shape)
+    self.init(shape: other.shape, scalars: other.scalars)
   }
 
   init<S : Sequence>(shape: [Int], scalars: S) where S.Element == Scalar {
     let scalarCount = shape.reduce(1, *)
-    let buffer = TensorBuffer<Scalar>.create(count: scalarCount) { buffPtr in
-      let ptr = buffPtr.baseAddress!
-      // TODO: Refactor with better pointer initializers in Swift 4.1.
-      var i = 0
-      for scalar in scalars {
-        guard i < scalarCount else { break }
-        ptr.advanced(by: i).initialize(to: scalar)
-        i += 1
-      }
-      // If the sequence has fewer elements than the shape needs, this is a
-      // precondition failure.
-      precondition(i == scalarCount,
+    let scalars = Array(scalars)
+    // If the sequence has fewer elements than the shape needs, this is a
+    // precondition failure.
+    precondition(scalars.count == scalarCount,
                    "The sequence has fewer elements than needed by the shape.")
-    }
-    self.init(buffer: buffer, shape: shape)
+    self.init(shape: shape, scalars: scalars)
   }
 
   /// Creates a `ShapedArray` from a scalar value.
   init(_ scalar: Scalar) {
-    let buffer = TensorBuffer<Scalar>.create(count: 1) { buffPtr in
-      let ptr = buffPtr.baseAddress!
-      ptr.initialize(to: scalar)
-    }
-    self.init(buffer: buffer, shape: [])
+    let element = [scalar]
+    self.init(shape: [], scalars: element)
   }
 
   /// Creates a `ShapedArray` with the specified shape and a single, repeated
@@ -397,11 +264,8 @@ public extension ShapedArray {
   ///   - repeatedValue: The scalar value to repeat.
   init(shape: [Int], repeating repeatedValue: Scalar) {
     let scalarCount = shape.reduce(1, *)
-    let buffer = TensorBuffer<Scalar>.create(count: scalarCount) { buffPtr in
-      let ptr = buffPtr.baseAddress!
-      ptr.initialize(repeating: repeatedValue, count: scalarCount)
-    }
-    self.init(buffer: buffer, shape: shape)
+    let scalars = Array(repeating: repeatedValue, count: scalarCount)
+    self.init(shape: shape, scalars: scalars)
   }
 }
 
@@ -486,16 +350,15 @@ public extension ShapedArray {
   func withUnsafeBufferPointer<Result>(
     _ body: (UnsafeBufferPointer<Scalar>) throws -> Result
   ) rethrows -> Result {
-    return try buffer.withUnsafeMutableBufferPointer { ptr in
-      try body(UnsafeBufferPointer(ptr))
+    return try scalars.withUnsafeBufferPointer { ptr in
+      try body(ptr)
     }
   }
 
   mutating func withUnsafeMutableBufferPointer<Result>(
     _ body: (inout UnsafeMutableBufferPointer<Scalar>) throws -> Result
   ) rethrows -> Result {
-    ensureUniquelyReferenced()
-    return try buffer.withUnsafeMutableBufferPointer { ptr in
+    return try scalars.withUnsafeMutableBufferPointer { ptr in
       try body(&ptr)
     }
   }
@@ -511,24 +374,20 @@ extension ShapedArray where Scalar : AccelerableByTensorFlow {
   func makeTensorHandle() -> TensorHandle<Scalar> {
     // This initializer is designed to optimize conversion from TF-allocated
     // `ShapedArray` instances.
-    switch buffer.allocation {
-    case let .native(box):
-      precondition(rank <= Int32.max, """
-        Conversion to TensorHandle is undefined when rank exceeds Int32.max.
-        """)
-      precondition(shape.forAll { $0 <= Int32.max }, """
-        Conversion to TensorHandle is undefined when shape dimensions exceed \
-        Int32.max.
-        """)
-      return TensorHandle<Scalar>(
-        shape: shape.map(Int32.init),
-        scalarsInitializer: { addr in
-          addr.initialize(from: box.array, count: scalarCount)
-        }
-      )
-    case let .tensorFlow(cTensor):
-      return TensorHandle(copyingFromCTensor: cTensor)
-    }
+    precondition(rank <= Int32.max, """
+      Conversion to TensorHandle is undefined when rank exceeds Int32.max.
+      """)
+    precondition(shape.forAll { $0 <= Int32.max }, """
+      Conversion to TensorHandle is undefined when shape dimensions exceed \
+      Int32.max.
+      """)
+    return TensorHandle<Scalar>(
+      shape: shape.map(Int32.init),
+      scalarsInitializer: { addr in
+        // FIXME
+        addr.initialize(from: scalars, count: scalarCount)
+      }
+    )
   }
 }
 
@@ -676,6 +535,15 @@ public extension ShapedArraySlice {
 
   var scalarCount: Int {
     return shape.reduce(1, *)
+  }
+  
+  var scalars: ArraySlice<Scalar> {
+    get {
+      return base.scalars[scalarRange]
+    }
+    set {
+      base.scalars[scalarRange] = newValue
+    }
   }
 }
 
