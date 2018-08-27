@@ -59,6 +59,8 @@ namespace tf {
   /// struct of such.
   bool isTensorFlowValueOrAggregate(Type ty);
 
+  bool getInnermostTensorFlowValueTypes(Type ty, SmallVectorImpl<Type> &result);
+
   /// This class provides an efficient implementation of a predicate that
   /// determines whether a type is or contains a TensorFlow value that will be
   /// exposed after deabstraction.  This is a class instead of a simple function
