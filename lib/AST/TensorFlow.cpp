@@ -80,13 +80,8 @@ bool tf::isTensorFlowValueOrAggregate(Type ty) {
       [](Type eltTy) {
         return isTensorFlowValueOrAggregate(eltTy);
       });
-  if (auto *structTy = ty->getAs<StructType>())
-    return llvm::all_of(structTy->getDecl()->getStoredProperties(),
-      [](VarDecl *member) {
-        return isTensorFlowValueOrAggregate(member->getType());
-      });
-  if (auto *genericStructTy = ty->getAs<BoundGenericStructType>())
-    return llvm::all_of(genericStructTy->getDecl()->getStoredProperties(),
+  if (auto *structDecl = ty->getStructOrBoundGenericStruct())
+    return llvm::all_of(structDecl->getStoredProperties(),
       [](VarDecl *member) {
         return isTensorFlowValueOrAggregate(member->getType());
       });
@@ -95,13 +90,23 @@ bool tf::isTensorFlowValueOrAggregate(Type ty) {
 
 bool tf::getInnermostTensorFlowValueTypes(Type ty,
                                           SmallVectorImpl<Type> &result) {
-  if (isTensorFlowValue(ty))
-    //
+  if (isTensorFlowValue(ty)) {
+    result.push_back(ty);
+    return true;
+  }
   if (auto *tupleTy = ty->getAs<TupleType>())
-    //
-  if (auto *structTy = ty->getStructOrBoundGenericStruct())
-    //
-  return true;
+    return llvm::all_of(tupleTy->getElementTypes(),
+                        [&](Type eltTy) {
+                          return getInnermostTensorFlowValueTypes(
+                              eltTy, result);
+                        });
+  if (auto *structDecl = ty->getStructOrBoundGenericStruct())
+    return llvm::all_of(structDecl->getStoredProperties(),
+                        [&](VarDecl *member) {
+                          return getInnermostTensorFlowValueTypes(
+                              member->getType(), result);
+                        });
+  return false;
 }
 
 /// Return true if the specified type contains a TensorFlow value type that
