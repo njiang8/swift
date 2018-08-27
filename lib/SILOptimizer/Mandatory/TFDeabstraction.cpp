@@ -2314,19 +2314,18 @@ void TFDeabstraction::formGraphOp(SILTensorOpInfo &opInfo,
   }
   // Okay, if we got this far then we have all valid attributes and inputs.
   // Figure out the result list.
-  SmallVector<SILType, 4> resultTypes;
-  if (auto tuple = inst->getType().getAs<TupleType>()) {
-    for (auto elt : tuple->getElements()) {
-      auto eltTy = elt.getType()->getCanonicalType();
-      resultTypes.push_back(SILType::getPrimitiveObjectType(eltTy));
-    }
-  } else {
-    resultTypes.push_back(inst->getType());
-  }
+  SmallVector<Type, 4> resultTypes;
+
+  if (!tf::getInnermostTensorFlowValueTypes(
+           inst->getType().getASTType(), resultTypes))
+    return diagnoseInvalid("the specified result type is not a TensorFlow "
+                           "value type");
+  auto resultSILTypes = map<SmallVector<SILType, 8>>(resultTypes, [&](Type ty) {
+      return SILType::getPrimitiveObjectType(ty->getCanonicalType()); });
 
   auto op = B.createGraphOperation(getUserSourceLocation(inst),
                                    context.getIdentifier(opName), inputs,
-                                   attributes, resultTypes);
+                                   attributes, resultSILTypes);
 
   if (auto tuple = inst->getType().getAs<TupleType>()) {
     SmallVector<SILValue, 4> elts;

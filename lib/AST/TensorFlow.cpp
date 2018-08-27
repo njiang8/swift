@@ -93,6 +93,17 @@ bool tf::isTensorFlowValueOrAggregate(Type ty) {
   return false;
 }
 
+bool tf::getInnermostTensorFlowValueTypes(Type ty,
+                                          SmallVectorImpl<Type> &result) {
+  if (isTensorFlowValue(ty))
+    //
+  if (auto *tupleTy = ty->getAs<TupleType>())
+    //
+  if (auto *structTy = ty->getStructOrBoundGenericStruct())
+    //
+  return true;
+}
+
 /// Return true if the specified type contains a TensorFlow value type that
 /// will be exposed after deabstraction.
 /// If `checkHigherOrderFunctions`, also check for a function-typed `ty`, if its
